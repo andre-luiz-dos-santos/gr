@@ -8,11 +8,19 @@ import (
 	"testing"
 )
 
+func testPatterns(ignoreCase bool, values ...string) []searchPattern {
+	patterns := make([]searchPattern, 0, len(values))
+	for _, value := range values {
+		patterns = append(patterns, searchPattern{text: value, ignoreCase: ignoreCase})
+	}
+	return patterns
+}
+
 func TestScanReaderSingleRecord(t *testing.T) {
 	input := "Acct-Session-Id = \"abc\"\nUser-Name = \"alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, []string{"alice"}, false, false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), false)
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -36,7 +44,7 @@ func TestScanReaderMultipleRecords(t *testing.T) {
 	want := "Acct-Session-Id = \"two\"\nUser-Name = \"bob\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, []string{"bob"}, false, false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "bob"), false)
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -53,7 +61,7 @@ func TestScanReaderTrailingRecordWithoutBlankLine(t *testing.T) {
 	want := input + "\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, []string{"last"}, false, false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "last"), false)
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -70,7 +78,7 @@ func TestScanReaderMultipleBlankLinesBetweenRecords(t *testing.T) {
 	want := "Acct-Session-Id = \"one\"\nUser-Name = \"alice\"\n\nAcct-Session-Id = \"three\"\nUser-Name = \"alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, []string{"alice"}, false, false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), false)
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -85,7 +93,7 @@ func TestScanReaderMultipleBlankLinesBetweenRecords(t *testing.T) {
 func TestScanReaderNonMatch(t *testing.T) {
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader("User-Name = \"alice\"\n"), &out, []string{"bob"}, false, false)
+	matched, err := scanReader(strings.NewReader("User-Name = \"alice\"\n"), &out, testPatterns(false, "bob"), false)
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -101,7 +109,7 @@ func TestScanReaderCaseInsensitive(t *testing.T) {
 	input := "User-Name = \"Alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, []string{"alice"}, true, false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(true, "alice"), false)
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -110,6 +118,140 @@ func TestScanReaderCaseInsensitive(t *testing.T) {
 	}
 	if out.String() != input {
 		t.Fatalf("output mismatch\nwant: %q\ngot:  %q", input, out.String())
+	}
+}
+
+func TestRunMACSearchMatchesFormatsCaseInsensitive(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "detail-20260701")
+	records := []string{
+		"Calling-Station-Id = \"D8-36-5F-D2-D3-7C\"",
+		"Calling-Station-Id = \"d8-36-5f-d2-d3-7c\"",
+		"Calling-Station-Id = \"d8:36:5f:d2:d3:7c\"",
+		"Calling-Station-Id = \"D8365FD2D37C\"",
+		"Calling-Station-Id = \"d836.5fd2.d37c\"",
+		"Calling-Station-Id = \"D8:36:5f:D2:d3:7C\"",
+	}
+	input := strings.Join(records, "\n\n") + "\n"
+	if err := os.WriteFile(file, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-mac", "D8-36-5F-D2-D3-7C", file}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	if stdout.String() != input {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", input, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunMACSearchAcceptsInputFormats(t *testing.T) {
+	for _, mac := range []string{
+		"D8:36:5F:D2:D3:7C",
+		"D8365FD2D37C",
+		"D836.5FD2.D37C",
+	} {
+		t.Run(mac, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "detail-20260701")
+			input := "Calling-Station-Id = \"d8-36-5f-d2-d3-7c\"\n"
+			if err := os.WriteFile(file, []byte(input), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var stdout, stderr bytes.Buffer
+
+			code := run([]string{"-mac", mac, file}, strings.NewReader(""), &stdout, &stderr)
+			if code != exitMatch {
+				t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+			}
+			if stdout.String() != input {
+				t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", input, stdout.String())
+			}
+		})
+	}
+}
+
+func TestRunMACSearchWithoutPositionalPattern(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	input := "Calling-Station-Id = \"D836.5FD2.D37C\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "detail-20260701"), []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-mac", "D8-36-5F-D2-D3-7C"}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	if stdout.String() != input {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", input, stdout.String())
+	}
+}
+
+func TestRunMACSearchIsAdditiveWithExpressions(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "detail-20260701")
+	input := strings.Join([]string{
+		"User-Name = \"alice\"",
+		"",
+		"Calling-Station-Id = \"D836.5FD2.D37C\"",
+		"",
+	}, "\n")
+	if err := os.WriteFile(file, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-e", "alice", "-mac", "D8-36-5F-D2-D3-7C", file}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	want := "User-Name = \"alice\"\n\nCalling-Station-Id = \"D836.5FD2.D37C\"\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"-mac", "D8-36-5F-D2-D3-7C", "alice", file}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch with positional pattern: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	if stdout.String() != want {
+		t.Fatalf("stdout mismatch with positional pattern\nwant: %q\ngot:  %q", want, stdout.String())
+	}
+}
+
+func TestRunRejectsInvalidMAC(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mac  string
+		want string
+	}{
+		{name: "empty", mac: "", want: "empty MAC address"},
+		{name: "short", mac: "D8-36", want: "expected 12 hex characters"},
+		{name: "non_hex", mac: "D8-36-5F-D2-D3-ZC", want: "contains non-hex character"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+
+			code := run([]string{"-mac", tc.mac}, strings.NewReader(""), &stdout, &stderr)
+			if code != exitUsageError {
+				t.Fatalf("exit code mismatch: want %d, got %d", exitUsageError, code)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("expected no stdout, got %q", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.want) {
+				t.Fatalf("stderr does not mention %q: %q", tc.want, stderr.String())
+			}
+		})
 	}
 }
 

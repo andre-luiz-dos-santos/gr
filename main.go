@@ -30,10 +30,15 @@ func (s *stringList) Set(value string) error {
 }
 
 type config struct {
-	patterns     []string
+	patterns     []searchPattern
 	files        []string
 	ignoreCase   bool
 	usageHandled bool
+}
+
+type searchPattern struct {
+	text       string
+	ignoreCase bool
 }
 
 func main() {
@@ -70,7 +75,7 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 			continue
 		}
 
-		fileMatched, err := scanReader(file, stdout, cfg.patterns, cfg.ignoreCase, printedAny)
+		fileMatched, err := scanReader(file, stdout, cfg.patterns, printedAny)
 		closeErr := file.Close()
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: %v\n", name, err)
@@ -95,14 +100,17 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 func parseArgs(args []string, output io.Writer) (config, error) {
 	var cfg config
 	var expressions stringList
+	var macs stringList
 
 	fs := flag.NewFlagSet("gr", flag.ContinueOnError)
 	fs.SetOutput(output)
 	fs.Var(&expressions, "e", "fixed string to search for; may be repeated")
+	fs.Var(&macs, "mac", "MAC address to search for in hyphen, colon, compact, or Cisco dotted format; may be repeated")
 	fs.BoolVar(&cfg.ignoreCase, "i", false, "ignore case distinctions")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: gr [flags] PATTERN [FILE ...]")
 		fmt.Fprintln(fs.Output(), "       gr [flags] -e PATTERN [-e PATTERN ...] [FILE ...]")
+		fmt.Fprintln(fs.Output(), "       gr [flags] -mac MAC [-mac MAC ...] [FILE ...]")
 		fmt.Fprintln(fs.Output(), "If no FILE is provided, recursively scans files with detail- in their name.")
 		fs.PrintDefaults()
 	}
@@ -116,26 +124,109 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 	}
 
 	remaining := fs.Args()
+	var normalPatterns []string
 	if len(expressions) > 0 {
-		cfg.patterns = expressions
+		normalPatterns = expressions
 		cfg.files = remaining
+	} else if len(macs) > 0 {
+		if allExistingFiles(remaining) {
+			cfg.files = remaining
+		} else if len(remaining) > 0 {
+			normalPatterns = []string{remaining[0]}
+			cfg.files = remaining[1:]
+		}
 	} else {
 		if len(remaining) == 0 {
 			fs.Usage()
 			return cfg, errors.New("missing pattern")
 		}
-		cfg.patterns = []string{remaining[0]}
+		normalPatterns = []string{remaining[0]}
 		cfg.files = remaining[1:]
 	}
 
-	for _, pattern := range cfg.patterns {
+	for _, pattern := range normalPatterns {
 		if pattern == "" {
 			fs.Usage()
 			return cfg, errors.New("empty pattern")
 		}
+		cfg.patterns = append(cfg.patterns, searchPattern{
+			text:       pattern,
+			ignoreCase: cfg.ignoreCase,
+		})
+	}
+
+	seenMACPattern := make(map[string]bool)
+	for _, mac := range macs {
+		variants, err := macVariants(mac)
+		if err != nil {
+			fs.Usage()
+			return cfg, err
+		}
+		for _, variant := range variants {
+			key := strings.ToLower(variant)
+			if seenMACPattern[key] {
+				continue
+			}
+			seenMACPattern[key] = true
+			cfg.patterns = append(cfg.patterns, searchPattern{
+				text:       variant,
+				ignoreCase: true,
+			})
+		}
 	}
 
 	return cfg, nil
+}
+
+func allExistingFiles(paths []string) bool {
+	if len(paths) == 0 {
+		return true
+	}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return false
+		}
+	}
+	return true
+}
+
+func macVariants(mac string) ([]string, error) {
+	compact := strings.NewReplacer("-", "", ":", "", ".", "").Replace(mac)
+	if compact == "" {
+		return nil, errors.New("empty MAC address")
+	}
+	if len(compact) != 12 {
+		return nil, fmt.Errorf("invalid MAC address %q: expected 12 hex characters", mac)
+	}
+	for i := 0; i < len(compact); i++ {
+		if !isHexDigit(compact[i]) {
+			return nil, fmt.Errorf("invalid MAC address %q: contains non-hex character", mac)
+		}
+	}
+
+	compact = strings.ToUpper(compact)
+	return []string{
+		formatMAC(compact, "-", 2),
+		formatMAC(compact, ":", 2),
+		compact,
+		formatMAC(compact, ".", 4),
+	}, nil
+}
+
+func isHexDigit(ch byte) bool {
+	return ('0' <= ch && ch <= '9') || ('a' <= ch && ch <= 'f') || ('A' <= ch && ch <= 'F')
+}
+
+func formatMAC(compact, separator string, groupSize int) string {
+	var b strings.Builder
+	for i := 0; i < len(compact); i += groupSize {
+		if i > 0 {
+			b.WriteString(separator)
+		}
+		b.WriteString(compact[i : i+groupSize])
+	}
+	return b.String()
 }
 
 func discoverDetailFiles(root string) ([]string, error) {
@@ -155,7 +246,7 @@ func discoverDetailFiles(root string) ([]string, error) {
 	return files, err
 }
 
-func scanReader(r io.Reader, output io.Writer, patterns []string, ignoreCase bool, prefixBlankLine bool) (bool, error) {
+func scanReader(r io.Reader, output io.Writer, patterns []searchPattern, prefixBlankLine bool) (bool, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 
@@ -170,7 +261,7 @@ func scanReader(r io.Reader, output io.Writer, patterns []string, ignoreCase boo
 		text := strings.Join(record, "\n")
 		record = record[:0]
 
-		if !recordMatches(text, patterns, ignoreCase) {
+		if !recordMatches(text, patterns) {
 			return nil
 		}
 		if printedAny {
@@ -206,16 +297,19 @@ func scanReader(r io.Reader, output io.Writer, patterns []string, ignoreCase boo
 	return matched, nil
 }
 
-func recordMatches(record string, patterns []string, ignoreCase bool) bool {
-	if ignoreCase {
-		record = strings.ToLower(record)
-	}
-
+func recordMatches(record string, patterns []searchPattern) bool {
+	var lowerRecord string
 	for _, pattern := range patterns {
-		if ignoreCase {
-			pattern = strings.ToLower(pattern)
+		recordToSearch := record
+		patternToSearch := pattern.text
+		if pattern.ignoreCase {
+			if lowerRecord == "" {
+				lowerRecord = strings.ToLower(record)
+			}
+			recordToSearch = lowerRecord
+			patternToSearch = strings.ToLower(pattern.text)
 		}
-		if strings.Contains(record, pattern) {
+		if strings.Contains(recordToSearch, patternToSearch) {
 			return true
 		}
 	}
