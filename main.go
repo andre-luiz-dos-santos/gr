@@ -30,10 +30,11 @@ func (s *stringList) Set(value string) error {
 }
 
 type config struct {
-	patterns     []searchPattern
-	files        []string
-	ignoreCase   bool
-	usageHandled bool
+	patterns         []searchPattern
+	files            []string
+	ignoreCase       bool
+	usageHandled     bool
+	macFileCandidate string
 }
 
 type searchPattern struct {
@@ -57,12 +58,30 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 
 	matched, hadReadError := false, false
 	files := cfg.files
+	if cfg.macFileCandidate != "" {
+		matches, err := discoverFilePatternMatches(".", cfg.macFileCandidate)
+		if err != nil {
+			fmt.Fprintf(stderr, ".: %v\n", err)
+			hadReadError = true
+		} else if len(matches) > 0 {
+			files = matches
+			cfg.patterns = cfg.patterns[1:]
+		}
+	}
 	if len(files) == 0 {
 		var err error
 		files, err = discoverDetailFiles(".")
 		if err != nil {
 			fmt.Fprintf(stderr, ".: %v\n", err)
 			hadReadError = true
+		}
+	} else {
+		var err error
+		files, err = resolveFilePatterns(files, ".")
+		if err != nil {
+			fmt.Fprintf(stderr, ".: %v\n", err)
+			hadReadError = true
+			files = nil
 		}
 	}
 
@@ -112,6 +131,7 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 		fmt.Fprintln(fs.Output(), "       gr [flags] -e PATTERN [-e PATTERN ...] [FILE ...]")
 		fmt.Fprintln(fs.Output(), "       gr [flags] -mac MAC [-mac MAC ...] [FILE ...]")
 		fmt.Fprintln(fs.Output(), "If no FILE is provided, recursively scans files with detail- in their name.")
+		fmt.Fprintln(fs.Output(), "Bare FILE arguments without a directory are matched recursively as basename glob patterns.")
 		fs.PrintDefaults()
 	}
 
@@ -133,6 +153,9 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 			cfg.files = remaining
 		} else if len(remaining) > 0 {
 			normalPatterns = []string{remaining[0]}
+			if len(remaining) == 1 {
+				cfg.macFileCandidate = remaining[0]
+			}
 			cfg.files = remaining[1:]
 		}
 	} else {
@@ -191,6 +214,31 @@ func allExistingFiles(paths []string) bool {
 	return true
 }
 
+func resolveFilePatterns(files []string, root string) ([]string, error) {
+	var resolved []string
+	for _, name := range files {
+		if hasDirSeparator(name) {
+			resolved = append(resolved, name)
+			continue
+		}
+
+		matches, err := discoverFilePatternMatches(root, name)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) == 0 {
+			resolved = append(resolved, name)
+			continue
+		}
+		resolved = append(resolved, matches...)
+	}
+	return resolved, nil
+}
+
+func hasDirSeparator(path string) bool {
+	return strings.ContainsRune(path, os.PathSeparator)
+}
+
 func macVariants(mac string) ([]string, error) {
 	compact := strings.NewReplacer("-", "", ":", "", ".", "").Replace(mac)
 	if compact == "" {
@@ -239,6 +287,27 @@ func discoverDetailFiles(root string) ([]string, error) {
 			return nil
 		}
 		if strings.Contains(entry.Name(), "detail-") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
+}
+
+func discoverFilePatternMatches(root, pattern string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		matched, err := filepath.Match(pattern, entry.Name())
+		if err != nil {
+			return err
+		}
+		if matched {
 			files = append(files, path)
 		}
 		return nil

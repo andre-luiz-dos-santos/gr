@@ -194,6 +194,40 @@ func TestRunMACSearchWithoutPositionalPattern(t *testing.T) {
 	}
 }
 
+func TestRunMACSearchTreatsSingleMatchingBareArgumentAsFilePattern(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	for _, tc := range []struct {
+		dir  string
+		text string
+	}{
+		{dir: "one", text: "Calling-Station-Id = \"D8-36-5F-D2-D3-7C\"\n"},
+		{dir: "two", text: "Calling-Station-Id = \"D836.5FD2.D37C\"\n"},
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, tc.dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tc.dir, "detail-20260701"), []byte(tc.text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-mac", "D8-36-5F-D2-D3-7C", "detail-20260701"}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	want := "Calling-Station-Id = \"D8-36-5F-D2-D3-7C\"\n\nCalling-Station-Id = \"D836.5FD2.D37C\"\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
 func TestRunMACSearchIsAdditiveWithExpressions(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "detail-20260701")
@@ -288,6 +322,81 @@ func TestRunDiscoversDetailFilesWhenNoFilesProvided(t *testing.T) {
 	}
 }
 
+func TestRunExpandsBareFilePatternRecursively(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	for _, tc := range []struct {
+		dir  string
+		text string
+	}{
+		{dir: "186.232.34.28", text: "User-Name = \"match-34\"\n"},
+		{dir: "186.232.38.22", text: "User-Name = \"match-22\"\n"},
+		{dir: "186.232.38.25", text: "User-Name = \"match-25\"\n"},
+	} {
+		if err := os.MkdirAll(filepath.Join(dir, tc.dir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, tc.dir, "detail-20260701"), []byte(tc.text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "ignored"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "ignored", "detail-20260702"), []byte("User-Name = \"match-ignored\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-e", "match", "detail-20260701"}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	want := "User-Name = \"match-34\"\n\nUser-Name = \"match-22\"\n\nUser-Name = \"match-25\"\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunExpandsBareGlobFilePatternRecursively(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	for _, name := range []string{"a", "b"} {
+		if err := os.MkdirAll(filepath.Join(dir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a", "detail-20260701"), []byte("User-Name = \"alice\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b", "detail-20260702"), []byte("User-Name = \"bob\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b", "auth-detail-20260702"), []byte("User-Name = \"carol\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-e", "User-Name", "detail-*"}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	want := "User-Name = \"alice\"\n\nUser-Name = \"bob\"\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
 func TestRunReadsMultipleFilesInOrder(t *testing.T) {
 	dir := t.TempDir()
 	first := filepath.Join(dir, "first.detail")
@@ -323,6 +432,22 @@ func TestRunReturnsNoMatchExitCode(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunKeepsMissingBareFilePatternAsExplicitFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-e", "alice", "missing.detail"}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitNoMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d", exitNoMatch, code)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("expected no stdout, got %q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "missing.detail") {
+		t.Fatalf("stderr does not mention missing file: %q", stderr.String())
 	}
 }
 
