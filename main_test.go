@@ -113,15 +113,33 @@ func TestScanReaderCaseInsensitive(t *testing.T) {
 	}
 }
 
-func TestRunReadsStdin(t *testing.T) {
+func TestRunDiscoversDetailFilesWhenNoFilesProvided(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "detail-20260319"), []byte("User-Name = \"alice\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(dir, "nested")
+	if err := os.Mkdir(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "auth-detail-20250703"), []byte("User-Name = \"bob\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nested, "first.detail"), []byte("User-Name = \"alice\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	var stdout, stderr bytes.Buffer
 
-	code := run([]string{"alice"}, strings.NewReader("User-Name = \"alice\"\n"), &stdout, &stderr)
+	code := run([]string{"-e", "alice", "-e", "bob"}, strings.NewReader(""), &stdout, &stderr)
 	if code != exitMatch {
 		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
 	}
-	if stdout.String() != "User-Name = \"alice\"\n" {
-		t.Fatalf("stdout mismatch: %q", stdout.String())
+	want := "User-Name = \"alice\"\n\nUser-Name = \"bob\"\n"
+	if stdout.String() != want {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr, got %q", stderr.String())
@@ -151,6 +169,7 @@ func TestRunReadsMultipleFilesInOrder(t *testing.T) {
 }
 
 func TestRunReturnsNoMatchExitCode(t *testing.T) {
+	t.Chdir(t.TempDir())
 	var stdout, stderr bytes.Buffer
 
 	code := run([]string{"missing"}, strings.NewReader("User-Name = \"alice\"\n"), &stdout, &stderr)

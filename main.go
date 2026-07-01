@@ -6,7 +6,9 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -38,7 +40,7 @@ func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 	cfg, err := parseArgs(args, stderr)
 	if err != nil {
 		if cfg.usageHandled {
@@ -49,37 +51,38 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	matched, hadReadError := false, false
-	if len(cfg.files) == 0 {
+	files := cfg.files
+	if len(files) == 0 {
 		var err error
-		matched, err = scanReader(stdin, stdout, cfg.patterns, cfg.ignoreCase, false)
+		files, err = discoverDetailFiles(".")
 		if err != nil {
-			fmt.Fprintf(stderr, "stdin: %v\n", err)
+			fmt.Fprintf(stderr, ".: %v\n", err)
 			hadReadError = true
 		}
-	} else {
-		printedAny := false
-		for _, name := range cfg.files {
-			file, err := os.Open(name)
-			if err != nil {
-				fmt.Fprintf(stderr, "%s: %v\n", name, err)
-				hadReadError = true
-				continue
-			}
+	}
 
-			fileMatched, err := scanReader(file, stdout, cfg.patterns, cfg.ignoreCase, printedAny)
-			closeErr := file.Close()
-			if err != nil {
-				fmt.Fprintf(stderr, "%s: %v\n", name, err)
-				hadReadError = true
-			}
-			if closeErr != nil {
-				fmt.Fprintf(stderr, "%s: %v\n", name, closeErr)
-				hadReadError = true
-			}
-			if fileMatched {
-				matched = true
-				printedAny = true
-			}
+	printedAny := false
+	for _, name := range files {
+		file, err := os.Open(name)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", name, err)
+			hadReadError = true
+			continue
+		}
+
+		fileMatched, err := scanReader(file, stdout, cfg.patterns, cfg.ignoreCase, printedAny)
+		closeErr := file.Close()
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", name, err)
+			hadReadError = true
+		}
+		if closeErr != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", name, closeErr)
+			hadReadError = true
+		}
+		if fileMatched {
+			matched = true
+			printedAny = true
 		}
 	}
 
@@ -100,6 +103,7 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: gr [flags] PATTERN [FILE ...]")
 		fmt.Fprintln(fs.Output(), "       gr [flags] -e PATTERN [-e PATTERN ...] [FILE ...]")
+		fmt.Fprintln(fs.Output(), "If no FILE is provided, recursively scans files with detail- in their name.")
 		fs.PrintDefaults()
 	}
 
@@ -132,6 +136,23 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 	}
 
 	return cfg, nil
+}
+
+func discoverDetailFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		if strings.Contains(entry.Name(), "detail-") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	return files, err
 }
 
 func scanReader(r io.Reader, output io.Writer, patterns []string, ignoreCase bool, prefixBlankLine bool) (bool, error) {
