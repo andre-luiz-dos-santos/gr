@@ -20,7 +20,7 @@ func TestScanReaderSingleRecord(t *testing.T) {
 	input := "Acct-Session-Id = \"abc\"\nUser-Name = \"alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestScanReaderMultipleRecords(t *testing.T) {
 	want := "Acct-Session-Id = \"two\"\nUser-Name = \"bob\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "bob"), false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "bob"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestScanReaderTrailingRecordWithoutBlankLine(t *testing.T) {
 	want := input + "\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "last"), false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "last"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestScanReaderMultipleBlankLinesBetweenRecords(t *testing.T) {
 	want := "Acct-Session-Id = \"one\"\nUser-Name = \"alice\"\n\nAcct-Session-Id = \"three\"\nUser-Name = \"alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -93,7 +93,7 @@ func TestScanReaderMultipleBlankLinesBetweenRecords(t *testing.T) {
 func TestScanReaderNonMatch(t *testing.T) {
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader("User-Name = \"alice\"\n"), &out, testPatterns(false, "bob"), false)
+	matched, err := scanReader(strings.NewReader("User-Name = \"alice\"\n"), &out, testPatterns(false, "bob"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -109,7 +109,78 @@ func TestScanReaderCaseInsensitive(t *testing.T) {
 	input := "User-Name = \"Alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(true, "alice"), false)
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(true, "alice"), scanOptions{})
+	if err != nil {
+		t.Fatalf("scanReader returned error: %v", err)
+	}
+	if !matched {
+		t.Fatal("scanReader did not report a match")
+	}
+	if out.String() != input {
+		t.Fatalf("output mismatch\nwant: %q\ngot:  %q", input, out.String())
+	}
+}
+
+func TestScanReaderHighlightsMatches(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		input    string
+		patterns []searchPattern
+		want     string
+	}{
+		{
+			name:     "single exact match",
+			input:    "User-Name = \"alice\"\n",
+			patterns: testPatterns(false, "alice"),
+			want:     "User-Name = \"" + highlightStart + "alice" + highlightEnd + "\"\n",
+		},
+		{
+			name:     "multiple occurrences",
+			input:    "alice called alice\n",
+			patterns: testPatterns(false, "alice"),
+			want:     highlightStart + "alice" + highlightEnd + " called " + highlightStart + "alice" + highlightEnd + "\n",
+		},
+		{
+			name:     "case insensitive preserves casing",
+			input:    "User-Name = \"Alice\"\n",
+			patterns: testPatterns(true, "alice"),
+			want:     "User-Name = \"" + highlightStart + "Alice" + highlightEnd + "\"\n",
+		},
+		{
+			name:     "multiple patterns",
+			input:    "alice called bob\n",
+			patterns: testPatterns(false, "alice", "bob"),
+			want:     highlightStart + "alice" + highlightEnd + " called " + highlightStart + "bob" + highlightEnd + "\n",
+		},
+		{
+			name:     "overlapping patterns use leftmost longest",
+			input:    "aaaa\n",
+			patterns: testPatterns(false, "aa", "aaa"),
+			want:     highlightStart + "aaa" + highlightEnd + "a\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+
+			matched, err := scanReader(strings.NewReader(tc.input), &out, tc.patterns, scanOptions{highlight: true})
+			if err != nil {
+				t.Fatalf("scanReader returned error: %v", err)
+			}
+			if !matched {
+				t.Fatal("scanReader did not report a match")
+			}
+			if out.String() != tc.want {
+				t.Fatalf("output mismatch\nwant: %q\ngot:  %q", tc.want, out.String())
+			}
+		})
+	}
+}
+
+func TestScanReaderDoesNotHighlightWhenDisabled(t *testing.T) {
+	input := "User-Name = \"alice\"\n"
+	var out bytes.Buffer
+
+	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), scanOptions{highlight: false})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -147,6 +218,39 @@ func TestRunMACSearchMatchesFormatsCaseInsensitive(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("expected no stderr, got %q", stderr.String())
+	}
+}
+
+func TestRunDoesNotHighlightRegularFileOutput(t *testing.T) {
+	dir := t.TempDir()
+	inputFile := filepath.Join(dir, "detail-20260701")
+	outputFile := filepath.Join(dir, "output.txt")
+	input := "User-Name = \"alice\"\n"
+	if err := os.WriteFile(inputFile, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, err := os.Create(outputFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+
+	code := run([]string{"alice", inputFile}, strings.NewReader(""), stdout, &stderr)
+	closeErr := stdout.Close()
+	if closeErr != nil {
+		t.Fatalf("failed to close output file: %v", closeErr)
+	}
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+
+	got, err := os.ReadFile(outputFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != input {
+		t.Fatalf("output mismatch\nwant: %q\ngot:  %q", input, string(got))
 	}
 }
 

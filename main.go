@@ -9,13 +9,18 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
 	exitMatch      = 0
 	exitNoMatch    = 1
 	exitUsageError = 2
+
+	highlightStart = "\x1b[1;31m"
+	highlightEnd   = "\x1b[0m"
 )
 
 type stringList []string
@@ -40,6 +45,16 @@ type config struct {
 type searchPattern struct {
 	text       string
 	ignoreCase bool
+}
+
+type scanOptions struct {
+	prefixBlankLine bool
+	highlight       bool
+}
+
+type byteRange struct {
+	start int
+	end   int
 }
 
 func main() {
@@ -86,6 +101,7 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 	}
 
 	printedAny := false
+	highlight := outputIsTerminal(stdout)
 	for _, name := range files {
 		file, err := os.Open(name)
 		if err != nil {
@@ -94,7 +110,10 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 			continue
 		}
 
-		fileMatched, err := scanReader(file, stdout, cfg.patterns, printedAny)
+		fileMatched, err := scanReader(file, stdout, cfg.patterns, scanOptions{
+			prefixBlankLine: printedAny,
+			highlight:       highlight,
+		})
 		closeErr := file.Close()
 		if err != nil {
 			fmt.Fprintf(stderr, "%s: %v\n", name, err)
@@ -114,6 +133,18 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 		return exitNoMatch
 	}
 	return exitMatch
+}
+
+func outputIsTerminal(output io.Writer) bool {
+	file, ok := output.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func parseArgs(args []string, output io.Writer) (config, error) {
@@ -315,12 +346,12 @@ func discoverFilePatternMatches(root, pattern string) ([]string, error) {
 	return files, err
 }
 
-func scanReader(r io.Reader, output io.Writer, patterns []searchPattern, prefixBlankLine bool) (bool, error) {
+func scanReader(r io.Reader, output io.Writer, patterns []searchPattern, options scanOptions) (bool, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 
 	matched := false
-	printedAny := prefixBlankLine
+	printedAny := options.prefixBlankLine
 	var record []string
 
 	flush := func() error {
@@ -337,6 +368,9 @@ func scanReader(r io.Reader, output io.Writer, patterns []searchPattern, prefixB
 			if _, err := fmt.Fprintln(output); err != nil {
 				return err
 			}
+		}
+		if options.highlight {
+			text = highlightMatches(text, patterns)
 		}
 		if _, err := fmt.Fprintln(output, text); err != nil {
 			return err
@@ -364,6 +398,107 @@ func scanReader(r io.Reader, output io.Writer, patterns []searchPattern, prefixB
 	}
 
 	return matched, nil
+}
+
+func highlightMatches(record string, patterns []searchPattern) string {
+	ranges := matchingRanges(record, patterns)
+	if len(ranges) == 0 {
+		return record
+	}
+
+	var b strings.Builder
+	b.Grow(len(record) + len(ranges)*(len(highlightStart)+len(highlightEnd)))
+	position := 0
+	for _, match := range ranges {
+		b.WriteString(record[position:match.start])
+		b.WriteString(highlightStart)
+		b.WriteString(record[match.start:match.end])
+		b.WriteString(highlightEnd)
+		position = match.end
+	}
+	b.WriteString(record[position:])
+	return b.String()
+}
+
+func matchingRanges(record string, patterns []searchPattern) []byteRange {
+	var candidates []byteRange
+	var foldedRecord string
+	var foldedMap []byteRange
+
+	for _, pattern := range patterns {
+		needle := pattern.text
+		searchRecord := record
+		var searchMap []byteRange
+
+		if pattern.ignoreCase {
+			if foldedRecord == "" {
+				foldedRecord, foldedMap = foldWithByteMap(record)
+			}
+			searchRecord = foldedRecord
+			searchMap = foldedMap
+			needle, _ = foldWithByteMap(pattern.text)
+		}
+		if needle == "" {
+			continue
+		}
+
+		offset := 0
+		for offset <= len(searchRecord) {
+			index := strings.Index(searchRecord[offset:], needle)
+			if index < 0 {
+				break
+			}
+
+			start := offset + index
+			end := start + len(needle)
+			if searchMap == nil {
+				candidates = append(candidates, byteRange{start: start, end: end})
+			} else {
+				candidates = append(candidates, byteRange{
+					start: searchMap[start].start,
+					end:   searchMap[end-1].end,
+				})
+			}
+			offset = start + 1
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].start != candidates[j].start {
+			return candidates[i].start < candidates[j].start
+		}
+		return candidates[i].end > candidates[j].end
+	})
+
+	merged := candidates[:0]
+	position := 0
+	for _, candidate := range candidates {
+		if candidate.start < position {
+			continue
+		}
+		merged = append(merged, candidate)
+		position = candidate.end
+	}
+	return merged
+}
+
+func foldWithByteMap(text string) (string, []byteRange) {
+	var folded strings.Builder
+	byteMap := make([]byteRange, 0, len(text))
+	for start, r := range text {
+		_, size := utf8.DecodeRuneInString(text[start:])
+		end := start + size
+		lower := strings.ToLower(string(r))
+		folded.WriteString(lower)
+		for i := 0; i < len(lower); i++ {
+			byteMap = append(byteMap, byteRange{start: start, end: end})
+		}
+	}
+	return folded.String(), byteMap
 }
 
 func recordMatches(record string, patterns []searchPattern) bool {
