@@ -497,9 +497,10 @@ func collectMatchingRecords(r io.Reader, filters []searchFilter, nextIndex *int)
 }
 
 func timestampLine(record string) (string, bool) {
-	for _, line := range strings.Split(record, "\n") {
-		if strings.HasPrefix(line, "Timestamp") {
-			return line, true
+	for line := range strings.SplitSeq(record, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Timestamp") {
+			return trimmed, true
 		}
 	}
 	return "", false

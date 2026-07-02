@@ -596,15 +596,18 @@ func TestRunSortsMatchesByTimestampAcrossFiles(t *testing.T) {
 	first := filepath.Join(dir, "first.detail")
 	second := filepath.Join(dir, "second.detail")
 	firstInput := strings.Join([]string{
-		"Timestamp = \"2026-07-02 10:00:00\"",
-		"User-Name = \"second\"",
+		"\tTimestamp = 1782924948",
+		"User-Name = \"first\"",
+		"",
+		"\tTimestamp = 1782939812",
+		"User-Name = \"third\"",
 		"",
 		"User-Name = \"no-timestamp-one\"",
 		"",
 	}, "\n")
 	secondInput := strings.Join([]string{
-		"Timestamp = \"2026-07-01 10:00:00\"",
-		"User-Name = \"first\"",
+		"\tTimestamp = 1782930768",
+		"User-Name = \"second\"",
 		"",
 		"User-Name = \"no-timestamp-two\"",
 		"",
@@ -622,11 +625,14 @@ func TestRunSortsMatchesByTimestampAcrossFiles(t *testing.T) {
 		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
 	}
 	wantStdout := strings.Join([]string{
-		"Timestamp = \"2026-07-01 10:00:00\"",
+		"\tTimestamp = 1782924948",
 		"User-Name = \"first\"",
 		"",
-		"Timestamp = \"2026-07-02 10:00:00\"",
+		"\tTimestamp = 1782930768",
 		"User-Name = \"second\"",
+		"",
+		"\tTimestamp = 1782939812",
+		"User-Name = \"third\"",
 		"",
 		"User-Name = \"no-timestamp-one\"",
 		"",
@@ -636,7 +642,7 @@ func TestRunSortsMatchesByTimestampAcrossFiles(t *testing.T) {
 	if stdout.String() != wantStdout {
 		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", wantStdout, stdout.String())
 	}
-	wantStderr := fmt.Sprintf("Reading %s (matches so far: 0)\nReading %s (matches so far: 2)\n", first, second)
+	wantStderr := fmt.Sprintf("Reading %s (matches so far: 0)\nReading %s (matches so far: 3)\n", first, second)
 	if stderr.String() != wantStderr {
 		t.Fatalf("stderr mismatch\nwant: %q\ngot:  %q", wantStderr, stderr.String())
 	}
