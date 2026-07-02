@@ -2,25 +2,49 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-func testPatterns(ignoreCase bool, values ...string) []searchPattern {
-	patterns := make([]searchPattern, 0, len(values))
+func testFilters(ignoreCase bool, values ...string) []searchFilter {
+	filters := make([]searchFilter, 0, len(values))
 	for _, value := range values {
-		patterns = append(patterns, searchPattern{text: value, ignoreCase: ignoreCase})
+		filters = append(filters, searchFilter{
+			alternatives: []searchPattern{{
+				text:       value,
+				ignoreCase: ignoreCase,
+			}},
+		})
 	}
-	return patterns
+	return filters
+}
+
+func TestParseArgsAcceptsSort(t *testing.T) {
+	var stderr bytes.Buffer
+
+	cfg, err := parseArgs([]string{"-sort", "-e", "alice", "detail-20260701"}, &stderr)
+	if err != nil {
+		t.Fatalf("parseArgs returned error: %v", err)
+	}
+	if !cfg.sortOutput {
+		t.Fatal("sortOutput was not set")
+	}
+	if len(cfg.filters) != 1 || len(cfg.filters[0].alternatives) != 1 || cfg.filters[0].alternatives[0].text != "alice" {
+		t.Fatalf("filters mismatch: %#v", cfg.filters)
+	}
+	if len(cfg.files) != 1 || cfg.files[0] != "detail-20260701" {
+		t.Fatalf("files mismatch: %#v", cfg.files)
+	}
 }
 
 func TestScanReaderSingleRecord(t *testing.T) {
 	input := "Acct-Session-Id = \"abc\"\nUser-Name = \"alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), scanOptions{})
+	matched, err := scanReader(strings.NewReader(input), &out, testFilters(false, "alice"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -44,7 +68,7 @@ func TestScanReaderMultipleRecords(t *testing.T) {
 	want := "Acct-Session-Id = \"two\"\nUser-Name = \"bob\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "bob"), scanOptions{})
+	matched, err := scanReader(strings.NewReader(input), &out, testFilters(false, "bob"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -61,7 +85,7 @@ func TestScanReaderTrailingRecordWithoutBlankLine(t *testing.T) {
 	want := input + "\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "last"), scanOptions{})
+	matched, err := scanReader(strings.NewReader(input), &out, testFilters(false, "last"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -78,7 +102,7 @@ func TestScanReaderMultipleBlankLinesBetweenRecords(t *testing.T) {
 	want := "Acct-Session-Id = \"one\"\nUser-Name = \"alice\"\n\nAcct-Session-Id = \"three\"\nUser-Name = \"alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), scanOptions{})
+	matched, err := scanReader(strings.NewReader(input), &out, testFilters(false, "alice"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -93,7 +117,7 @@ func TestScanReaderMultipleBlankLinesBetweenRecords(t *testing.T) {
 func TestScanReaderNonMatch(t *testing.T) {
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader("User-Name = \"alice\"\n"), &out, testPatterns(false, "bob"), scanOptions{})
+	matched, err := scanReader(strings.NewReader("User-Name = \"alice\"\n"), &out, testFilters(false, "bob"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -109,7 +133,7 @@ func TestScanReaderCaseInsensitive(t *testing.T) {
 	input := "User-Name = \"Alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(true, "alice"), scanOptions{})
+	matched, err := scanReader(strings.NewReader(input), &out, testFilters(true, "alice"), scanOptions{})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -121,48 +145,87 @@ func TestScanReaderCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestScanReaderRequiresAllFilters(t *testing.T) {
+	input := strings.Join([]string{
+		"Acct-Session-Id = \"missing-user\"",
+		"User-Name = \"carol\"",
+		"",
+		"Acct-Session-Id = \"session-123\"",
+		"User-Name = \"alice\"",
+		"",
+	}, "\n")
+	want := "Acct-Session-Id = \"session-123\"\nUser-Name = \"alice\"\n"
+	var out bytes.Buffer
+
+	matched, err := scanReader(strings.NewReader(input), &out, testFilters(false, "alice", "session-123"), scanOptions{})
+	if err != nil {
+		t.Fatalf("scanReader returned error: %v", err)
+	}
+	if !matched {
+		t.Fatal("scanReader did not report a match")
+	}
+	if out.String() != want {
+		t.Fatalf("output mismatch\nwant: %q\ngot:  %q", want, out.String())
+	}
+}
+
+func TestScanReaderRejectsRecordMissingOneFilter(t *testing.T) {
+	var out bytes.Buffer
+
+	matched, err := scanReader(strings.NewReader("User-Name = \"alice\"\n"), &out, testFilters(false, "alice", "session-123"), scanOptions{})
+	if err != nil {
+		t.Fatalf("scanReader returned error: %v", err)
+	}
+	if matched {
+		t.Fatal("scanReader reported a match")
+	}
+	if out.Len() != 0 {
+		t.Fatalf("expected no output, got %q", out.String())
+	}
+}
+
 func TestScanReaderHighlightsMatches(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		input    string
-		patterns []searchPattern
-		want     string
+		name    string
+		input   string
+		filters []searchFilter
+		want    string
 	}{
 		{
-			name:     "single exact match",
-			input:    "User-Name = \"alice\"\n",
-			patterns: testPatterns(false, "alice"),
-			want:     "User-Name = \"" + highlightStart + "alice" + highlightEnd + "\"\n",
+			name:    "single exact match",
+			input:   "User-Name = \"alice\"\n",
+			filters: testFilters(false, "alice"),
+			want:    "User-Name = \"" + highlightStart + "alice" + highlightEnd + "\"\n",
 		},
 		{
-			name:     "multiple occurrences",
-			input:    "alice called alice\n",
-			patterns: testPatterns(false, "alice"),
-			want:     highlightStart + "alice" + highlightEnd + " called " + highlightStart + "alice" + highlightEnd + "\n",
+			name:    "multiple occurrences",
+			input:   "alice called alice\n",
+			filters: testFilters(false, "alice"),
+			want:    highlightStart + "alice" + highlightEnd + " called " + highlightStart + "alice" + highlightEnd + "\n",
 		},
 		{
-			name:     "case insensitive preserves casing",
-			input:    "User-Name = \"Alice\"\n",
-			patterns: testPatterns(true, "alice"),
-			want:     "User-Name = \"" + highlightStart + "Alice" + highlightEnd + "\"\n",
+			name:    "case insensitive preserves casing",
+			input:   "User-Name = \"Alice\"\n",
+			filters: testFilters(true, "alice"),
+			want:    "User-Name = \"" + highlightStart + "Alice" + highlightEnd + "\"\n",
 		},
 		{
-			name:     "multiple patterns",
-			input:    "alice called bob\n",
-			patterns: testPatterns(false, "alice", "bob"),
-			want:     highlightStart + "alice" + highlightEnd + " called " + highlightStart + "bob" + highlightEnd + "\n",
+			name:    "multiple filters",
+			input:   "alice called bob\n",
+			filters: testFilters(false, "alice", "bob"),
+			want:    highlightStart + "alice" + highlightEnd + " called " + highlightStart + "bob" + highlightEnd + "\n",
 		},
 		{
-			name:     "overlapping patterns use leftmost longest",
-			input:    "aaaa\n",
-			patterns: testPatterns(false, "aa", "aaa"),
-			want:     highlightStart + "aaa" + highlightEnd + "a\n",
+			name:    "overlapping patterns use leftmost longest",
+			input:   "aaaa\n",
+			filters: testFilters(false, "aa", "aaa"),
+			want:    highlightStart + "aaa" + highlightEnd + "a\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
 
-			matched, err := scanReader(strings.NewReader(tc.input), &out, tc.patterns, scanOptions{highlight: true})
+			matched, err := scanReader(strings.NewReader(tc.input), &out, tc.filters, scanOptions{highlight: true})
 			if err != nil {
 				t.Fatalf("scanReader returned error: %v", err)
 			}
@@ -180,7 +243,7 @@ func TestScanReaderDoesNotHighlightWhenDisabled(t *testing.T) {
 	input := "User-Name = \"alice\"\n"
 	var out bytes.Buffer
 
-	matched, err := scanReader(strings.NewReader(input), &out, testPatterns(false, "alice"), scanOptions{highlight: false})
+	matched, err := scanReader(strings.NewReader(input), &out, testFilters(false, "alice"), scanOptions{highlight: false})
 	if err != nil {
 		t.Fatalf("scanReader returned error: %v", err)
 	}
@@ -332,12 +395,15 @@ func TestRunMACSearchTreatsSingleMatchingBareArgumentAsFilePattern(t *testing.T)
 	}
 }
 
-func TestRunMACSearchIsAdditiveWithExpressions(t *testing.T) {
+func TestRunMACSearchRequiresExpressionAndMAC(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "detail-20260701")
 	input := strings.Join([]string{
 		"User-Name = \"alice\"",
 		"",
+		"Calling-Station-Id = \"D836.5FD2.D37C\"",
+		"",
+		"User-Name = \"alice\"",
 		"Calling-Station-Id = \"D836.5FD2.D37C\"",
 		"",
 	}, "\n")
@@ -350,7 +416,7 @@ func TestRunMACSearchIsAdditiveWithExpressions(t *testing.T) {
 	if code != exitMatch {
 		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
 	}
-	want := "User-Name = \"alice\"\n\nCalling-Station-Id = \"D836.5FD2.D37C\"\n"
+	want := "User-Name = \"alice\"\nCalling-Station-Id = \"D836.5FD2.D37C\"\n"
 	if stdout.String() != want {
 		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
 	}
@@ -397,7 +463,7 @@ func TestRunDiscoversDetailFilesWhenNoFilesProvided(t *testing.T) {
 	dir := t.TempDir()
 	t.Chdir(dir)
 
-	if err := os.WriteFile(filepath.Join(dir, "detail-20260319"), []byte("User-Name = \"alice\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "detail-20260319"), []byte("User-Name = \"alice\"\nReply-Message = \"bob\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	nested := filepath.Join(dir, "nested")
@@ -417,7 +483,7 @@ func TestRunDiscoversDetailFilesWhenNoFilesProvided(t *testing.T) {
 	if code != exitMatch {
 		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
 	}
-	want := "User-Name = \"alice\"\n\nUser-Name = \"bob\"\n"
+	want := "User-Name = \"alice\"\nReply-Message = \"bob\"\n"
 	if stdout.String() != want {
 		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
 	}
@@ -505,10 +571,12 @@ func TestRunReadsMultipleFilesInOrder(t *testing.T) {
 	dir := t.TempDir()
 	first := filepath.Join(dir, "first.detail")
 	second := filepath.Join(dir, "second.detail")
-	if err := os.WriteFile(first, []byte("User-Name = \"alice\"\n"), 0o600); err != nil {
+	firstInput := "User-Name = \"alice\"\nReply-Message = \"bob\"\n"
+	secondInput := "User-Name = \"bob\"\nReply-Message = \"alice\"\n"
+	if err := os.WriteFile(first, []byte(firstInput), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(second, []byte("User-Name = \"bob\"\n"), 0o600); err != nil {
+	if err := os.WriteFile(second, []byte(secondInput), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var stdout, stderr bytes.Buffer
@@ -517,9 +585,87 @@ func TestRunReadsMultipleFilesInOrder(t *testing.T) {
 	if code != exitMatch {
 		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
 	}
-	want := "User-Name = \"alice\"\n\nUser-Name = \"bob\"\n"
+	want := firstInput + "\n" + secondInput
 	if stdout.String() != want {
 		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
+	}
+}
+
+func TestRunSortsMatchesByTimestampAcrossFiles(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.detail")
+	second := filepath.Join(dir, "second.detail")
+	firstInput := strings.Join([]string{
+		"Timestamp = \"2026-07-02 10:00:00\"",
+		"User-Name = \"second\"",
+		"",
+		"User-Name = \"no-timestamp-one\"",
+		"",
+	}, "\n")
+	secondInput := strings.Join([]string{
+		"Timestamp = \"2026-07-01 10:00:00\"",
+		"User-Name = \"first\"",
+		"",
+		"User-Name = \"no-timestamp-two\"",
+		"",
+	}, "\n")
+	if err := os.WriteFile(first, []byte(firstInput), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte(secondInput), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-sort", "-e", "User-Name", first, second}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	wantStdout := strings.Join([]string{
+		"Timestamp = \"2026-07-01 10:00:00\"",
+		"User-Name = \"first\"",
+		"",
+		"Timestamp = \"2026-07-02 10:00:00\"",
+		"User-Name = \"second\"",
+		"",
+		"User-Name = \"no-timestamp-one\"",
+		"",
+		"User-Name = \"no-timestamp-two\"",
+		"",
+	}, "\n")
+	if stdout.String() != wantStdout {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", wantStdout, stdout.String())
+	}
+	wantStderr := fmt.Sprintf("Reading %s (matches so far: 0)\nReading %s (matches so far: 2)\n", first, second)
+	if stderr.String() != wantStderr {
+		t.Fatalf("stderr mismatch\nwant: %q\ngot:  %q", wantStderr, stderr.String())
+	}
+}
+
+func TestRunWithoutSortKeepsFileOrderWithTimestamps(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.detail")
+	second := filepath.Join(dir, "second.detail")
+	firstInput := "Timestamp = \"2026-07-02 10:00:00\"\nUser-Name = \"second\"\n"
+	secondInput := "Timestamp = \"2026-07-01 10:00:00\"\nUser-Name = \"first\"\n"
+	if err := os.WriteFile(first, []byte(firstInput), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte(secondInput), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+
+	code := run([]string{"-e", "User-Name", first, second}, strings.NewReader(""), &stdout, &stderr)
+	if code != exitMatch {
+		t.Fatalf("exit code mismatch: want %d, got %d; stderr=%q", exitMatch, code, stderr.String())
+	}
+	want := firstInput + "\n" + secondInput
+	if stdout.String() != want {
+		t.Fatalf("stdout mismatch\nwant: %q\ngot:  %q", want, stdout.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("expected no stderr, got %q", stderr.String())
 	}
 }
 

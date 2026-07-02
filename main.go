@@ -35,11 +35,16 @@ func (s *stringList) Set(value string) error {
 }
 
 type config struct {
-	patterns         []searchPattern
+	filters          []searchFilter
 	files            []string
 	ignoreCase       bool
+	sortOutput       bool
 	usageHandled     bool
 	macFileCandidate string
+}
+
+type searchFilter struct {
+	alternatives []searchPattern
 }
 
 type searchPattern struct {
@@ -50,6 +55,13 @@ type searchPattern struct {
 type scanOptions struct {
 	prefixBlankLine bool
 	highlight       bool
+}
+
+type matchedRecord struct {
+	text         string
+	timestamp    string
+	index        int
+	hasTimestamp bool
 }
 
 type byteRange struct {
@@ -80,7 +92,7 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 			hadReadError = true
 		} else if len(matches) > 0 {
 			files = matches
-			cfg.patterns = cfg.patterns[1:]
+			cfg.filters = cfg.filters[1:]
 		}
 	}
 	if len(files) == 0 {
@@ -100,8 +112,27 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 
-	printedAny := false
 	highlight := outputIsTerminal(stdout)
+	if cfg.sortOutput {
+		records, hadSortedReadError := collectSortedMatches(files, stderr, cfg.filters)
+		if hadSortedReadError {
+			hadReadError = true
+		}
+		if len(records) > 0 {
+			matched = true
+		}
+		sortMatchedRecords(records)
+		if err := printMatchedRecords(records, stdout, cfg.filters, highlight); err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			hadReadError = true
+		}
+		if !matched || hadReadError {
+			return exitNoMatch
+		}
+		return exitMatch
+	}
+
+	printedAny := false
 	for _, name := range files {
 		file, err := os.Open(name)
 		if err != nil {
@@ -110,7 +141,7 @@ func run(args []string, _ io.Reader, stdout, stderr io.Writer) int {
 			continue
 		}
 
-		fileMatched, err := scanReader(file, stdout, cfg.patterns, scanOptions{
+		fileMatched, err := scanReader(file, stdout, cfg.filters, scanOptions{
 			prefixBlankLine: printedAny,
 			highlight:       highlight,
 		})
@@ -157,10 +188,12 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 	fs.Var(&expressions, "e", "fixed string to search for; may be repeated")
 	fs.Var(&macs, "mac", "MAC address to search for in hyphen, colon, compact, or Cisco dotted format; may be repeated")
 	fs.BoolVar(&cfg.ignoreCase, "i", false, "ignore case distinctions")
+	fs.BoolVar(&cfg.sortOutput, "sort", false, "sort matching records by Timestamp after reading all files")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: gr [flags] PATTERN [FILE ...]")
 		fmt.Fprintln(fs.Output(), "       gr [flags] -e PATTERN [-e PATTERN ...] [FILE ...]")
 		fmt.Fprintln(fs.Output(), "       gr [flags] -mac MAC [-mac MAC ...] [FILE ...]")
+		fmt.Fprintln(fs.Output(), "Records must match every supplied pattern; each -mac accepts any supported MAC format.")
 		fmt.Fprintln(fs.Output(), "If no FILE is provided, recursively scans files with detail- in their name.")
 		fmt.Fprintln(fs.Output(), "Bare FILE arguments without a directory are matched recursively as basename glob patterns.")
 		fs.PrintDefaults()
@@ -203,30 +236,36 @@ func parseArgs(args []string, output io.Writer) (config, error) {
 			fs.Usage()
 			return cfg, errors.New("empty pattern")
 		}
-		cfg.patterns = append(cfg.patterns, searchPattern{
-			text:       pattern,
-			ignoreCase: cfg.ignoreCase,
+		cfg.filters = append(cfg.filters, searchFilter{
+			alternatives: []searchPattern{{
+				text:       pattern,
+				ignoreCase: cfg.ignoreCase,
+			}},
 		})
 	}
 
-	seenMACPattern := make(map[string]bool)
 	for _, mac := range macs {
 		variants, err := macVariants(mac)
 		if err != nil {
 			fs.Usage()
 			return cfg, err
 		}
+		filter := searchFilter{
+			alternatives: make([]searchPattern, 0, len(variants)),
+		}
+		seenMACPattern := make(map[string]bool)
 		for _, variant := range variants {
 			key := strings.ToLower(variant)
 			if seenMACPattern[key] {
 				continue
 			}
 			seenMACPattern[key] = true
-			cfg.patterns = append(cfg.patterns, searchPattern{
+			filter.alternatives = append(filter.alternatives, searchPattern{
 				text:       variant,
 				ignoreCase: true,
 			})
 		}
+		cfg.filters = append(cfg.filters, filter)
 	}
 
 	return cfg, nil
@@ -346,12 +385,36 @@ func discoverFilePatternMatches(root, pattern string) ([]string, error) {
 	return files, err
 }
 
-func scanReader(r io.Reader, output io.Writer, patterns []searchPattern, options scanOptions) (bool, error) {
+func scanReader(r io.Reader, output io.Writer, filters []searchFilter, options scanOptions) (bool, error) {
+	matched := false
+	printedAny := options.prefixBlankLine
+
+	err := scanRecords(r, func(text string) error {
+		if !recordMatches(text, filters) {
+			return nil
+		}
+		if printedAny {
+			if _, err := fmt.Fprintln(output); err != nil {
+				return err
+			}
+		}
+		if options.highlight {
+			text = highlightMatches(text, filters)
+		}
+		if _, err := fmt.Fprintln(output, text); err != nil {
+			return err
+		}
+		printedAny = true
+		matched = true
+		return nil
+	})
+	return matched, err
+}
+
+func scanRecords(r io.Reader, handle func(string) error) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 
-	matched := false
-	printedAny := options.prefixBlankLine
 	var record []string
 
 	flush := func() error {
@@ -361,47 +424,121 @@ func scanReader(r io.Reader, output io.Writer, patterns []searchPattern, options
 		text := strings.Join(record, "\n")
 		record = record[:0]
 
-		if !recordMatches(text, patterns) {
-			return nil
-		}
-		if printedAny {
-			if _, err := fmt.Fprintln(output); err != nil {
-				return err
-			}
-		}
-		if options.highlight {
-			text = highlightMatches(text, patterns)
-		}
-		if _, err := fmt.Fprintln(output, text); err != nil {
-			return err
-		}
-		printedAny = true
-		matched = true
-		return nil
+		return handle(text)
 	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.TrimSpace(line) == "" {
 			if err := flush(); err != nil {
-				return matched, err
+				return err
 			}
 			continue
 		}
 		record = append(record, line)
 	}
 	if err := scanner.Err(); err != nil {
-		return matched, err
+		return err
 	}
 	if err := flush(); err != nil {
-		return matched, err
+		return err
 	}
 
-	return matched, nil
+	return nil
 }
 
-func highlightMatches(record string, patterns []searchPattern) string {
-	ranges := matchingRanges(record, patterns)
+func collectSortedMatches(files []string, stderr io.Writer, filters []searchFilter) ([]matchedRecord, bool) {
+	var records []matchedRecord
+	hadReadError := false
+	nextIndex := 0
+
+	for _, name := range files {
+		fmt.Fprintf(stderr, "Reading %s (matches so far: %d)\n", name, len(records))
+
+		file, err := os.Open(name)
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", name, err)
+			hadReadError = true
+			continue
+		}
+
+		fileRecords, err := collectMatchingRecords(file, filters, &nextIndex)
+		records = append(records, fileRecords...)
+		closeErr := file.Close()
+		if err != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", name, err)
+			hadReadError = true
+		}
+		if closeErr != nil {
+			fmt.Fprintf(stderr, "%s: %v\n", name, closeErr)
+			hadReadError = true
+		}
+	}
+
+	return records, hadReadError
+}
+
+func collectMatchingRecords(r io.Reader, filters []searchFilter, nextIndex *int) ([]matchedRecord, error) {
+	var records []matchedRecord
+	err := scanRecords(r, func(text string) error {
+		if !recordMatches(text, filters) {
+			return nil
+		}
+		record := matchedRecord{
+			text:  text,
+			index: *nextIndex,
+		}
+		record.timestamp, record.hasTimestamp = timestampLine(text)
+		records = append(records, record)
+		*nextIndex = *nextIndex + 1
+		return nil
+	})
+	return records, err
+}
+
+func timestampLine(record string) (string, bool) {
+	for _, line := range strings.Split(record, "\n") {
+		if strings.HasPrefix(line, "Timestamp") {
+			return line, true
+		}
+	}
+	return "", false
+}
+
+func sortMatchedRecords(records []matchedRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		left := records[i]
+		right := records[j]
+		if left.hasTimestamp != right.hasTimestamp {
+			return left.hasTimestamp
+		}
+		if left.hasTimestamp && left.timestamp != right.timestamp {
+			return left.timestamp < right.timestamp
+		}
+		return left.index < right.index
+	})
+}
+
+func printMatchedRecords(records []matchedRecord, output io.Writer, filters []searchFilter, highlight bool) error {
+	for i, record := range records {
+		if i > 0 {
+			if _, err := fmt.Fprintln(output); err != nil {
+				return err
+			}
+		}
+		text := record.text
+		if highlight {
+			text = highlightMatches(text, filters)
+		}
+		if _, err := fmt.Fprintln(output, text); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func highlightMatches(record string, filters []searchFilter) string {
+	ranges := matchingRanges(record, flattenFilters(filters))
 	if len(ranges) == 0 {
 		return record
 	}
@@ -501,21 +638,36 @@ func foldWithByteMap(text string) (string, []byteRange) {
 	return folded.String(), byteMap
 }
 
-func recordMatches(record string, patterns []searchPattern) bool {
+func recordMatches(record string, filters []searchFilter) bool {
 	var lowerRecord string
-	for _, pattern := range patterns {
-		recordToSearch := record
-		patternToSearch := pattern.text
-		if pattern.ignoreCase {
-			if lowerRecord == "" {
-				lowerRecord = strings.ToLower(record)
+	for _, filter := range filters {
+		matched := false
+		for _, pattern := range filter.alternatives {
+			recordToSearch := record
+			patternToSearch := pattern.text
+			if pattern.ignoreCase {
+				if lowerRecord == "" {
+					lowerRecord = strings.ToLower(record)
+				}
+				recordToSearch = lowerRecord
+				patternToSearch = strings.ToLower(pattern.text)
 			}
-			recordToSearch = lowerRecord
-			patternToSearch = strings.ToLower(pattern.text)
+			if strings.Contains(recordToSearch, patternToSearch) {
+				matched = true
+				break
+			}
 		}
-		if strings.Contains(recordToSearch, patternToSearch) {
-			return true
+		if !matched {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+func flattenFilters(filters []searchFilter) []searchPattern {
+	var patterns []searchPattern
+	for _, filter := range filters {
+		patterns = append(patterns, filter.alternatives...)
+	}
+	return patterns
 }
